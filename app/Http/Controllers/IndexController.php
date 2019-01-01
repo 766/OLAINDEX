@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Helpers\Constants;
 use App\Helpers\OneDrive;
 use App\Helpers\Tool;
 use Illuminate\Http\Request;
@@ -43,7 +44,13 @@ class IndexController extends Controller
      */
     public function __construct()
     {
-        $this->middleware(['checkInstall', 'checkToken', 'handleIllegalFile']);
+        $this->middleware([
+            'checkInstall',
+            'checkToken',
+            'handleIllegalFile',
+        ]);
+        $this->middleware('HandleEncryptDir')
+            ->only(Tool::config('encrypt_option', ['list']));
         $this->expires = Tool::config('expires', 10);
         $this->root = Tool::config('root', '/');
         $this->show = [
@@ -78,26 +85,29 @@ class IndexController extends Controller
     public function list(Request $request)
     {
         $realPath = $request->route()->parameter('query') ?? '/';
+        $limit = $request->get('limit', 20);
+        if (!is_numeric($limit)) {
+            Tool::showMessage('非法请求', false);
+
+            return view(config('olaindex.theme').'message');
+        }
         $graphPath = Tool::getOriginPath($realPath);
         $queryPath = trim(Tool::getAbsolutePath($realPath), '/');
         $origin_path = rawurldecode($queryPath);
         $path_array = $origin_path ? explode('/', $origin_path) : [];
-        $item = Cache::remember(
-            'one:file:'.$graphPath,
-            $this->expires,
-            function () use ($graphPath) {
-                $response = OneDrive::getItemByPath($graphPath);
-                if ($response['errno'] === 0) {
-                    return $response['data'];
-                } else {
-                    Tool::showMessage($response['msg'], false);
+        $pathKey = 'one:path:'.$graphPath;
+        if (Cache::has($pathKey)) {
+            $item = Cache::get($pathKey);
+        } else {
+            $response = OneDrive::getItemByPath($graphPath);
+            if ($response['errno'] === 0) {
+                $item = $response['data'];
+                Cache::put($pathKey, $item, $this->expires);
+            } else {
+                Tool::showMessage($response['msg'], false);
 
-                    return null;
-                }
+                return view(config('olaindex.theme').'message');
             }
-        );
-        if (is_null($item)) {
-            abort(404);
         }
         if (array_has($item, '@microsoft.graph.downloadUrl')) {
             return redirect()->away($item['@microsoft.graph.downloadUrl']);
@@ -109,7 +119,8 @@ class IndexController extends Controller
         } else {
             $response = OneDrive::getChildrenByPath(
                 $graphPath,
-                '?select=id,eTag,name,size,lastModifiedDateTime,file,image,folder,@microsoft.graph.downloadUrl&expand=thumbnails'
+                '?select=id,eTag,name,size,lastModifiedDateTime,file,image,folder,@microsoft.graph.downloadUrl'
+                .'&expand=thumbnails'
             );
             if ($response['errno'] === 0) {
                 $origin_items = $response['data'];
@@ -117,49 +128,14 @@ class IndexController extends Controller
             } else {
                 Tool::showMessage($response['msg'], false);
 
-                return view('message');
+                return view(config('olaindex.theme').'message');
             }
         }
-//        dd($origin_items);
         $hasImage = Tool::hasImages($origin_items);
         // 过滤微软OneNote文件
         $origin_items = array_where($origin_items, function ($value) {
             return !array_has($value, 'package.type');
         });
-        // 处理加密目录
-        if (!empty($origin_items['.password'])) {
-            $pass_id = $origin_items['.password']['id'];
-            $pass_url
-                = $origin_items['.password']['@microsoft.graph.downloadUrl'];
-            $key = 'password:'.$origin_path;
-            if (Session::has($key)) {
-                $data = Session::get($key);
-                $password = Tool::getFileContent($pass_url, false);
-                if (strcmp($password, decrypt($data['password'])) !== 0
-                    || time() > $data['expires']
-                ) {
-                    Session::forget($key);
-                    Tool::showMessage('密码已过期', false);
-
-                    return view(
-                        config('olaindex.theme').'password',
-                        compact('origin_path', 'pass_id')
-                    );
-                }
-            } else {
-                return view(
-                    config('olaindex.theme').'password',
-                    compact('origin_path', 'pass_id')
-                );
-            }
-        }
-        // 过滤受限隐藏目录
-        if (!empty($origin_items['.deny'])) {
-            if (!Session::has('LogInfo')) {
-                Tool::showMessage('目录访问受限，仅管理员可以访问！', false);
-                abort(403);
-            }
-        }
         // 处理 head/readme
         $head = array_key_exists('HEAD.md', $origin_items)
             ? Tool::markdown2Html(Tool::getFileContent($origin_items['HEAD.md']['@microsoft.graph.downloadUrl']))
@@ -167,13 +143,12 @@ class IndexController extends Controller
         $readme = array_key_exists('README.md', $origin_items)
             ? Tool::markdown2Html(Tool::getFileContent($origin_items['README.md']['@microsoft.graph.downloadUrl']))
             : '';
-        if (!session()->has('LogInfo')) {
+        if (!Session::has('LogInfo')) {
             $origin_items = array_except(
                 $origin_items,
                 ['README.md', 'HEAD.md', '.password', '.deny']
             );
         }
-        $limit = $request->get('limit', 20);
         $items = Tool::paginate($origin_items, $limit);
         $data = compact(
             'items',
@@ -218,7 +193,8 @@ class IndexController extends Controller
                 function () use ($graphPath) {
                     $response = OneDrive::getItemByPath(
                         $graphPath,
-                        '?select=id,eTag,name,size,lastModifiedDateTime,file,image,@microsoft.graph.downloadUrl&expand=thumbnails'
+                        '?select=id,eTag,name,size,lastModifiedDateTime,file,image,@microsoft.graph.downloadUrl'
+                        .'&expand=thumbnails'
                     );
                     if ($response['errno'] === 0) {
                         return $response['data'];
@@ -240,11 +216,13 @@ class IndexController extends Controller
     {
         $realPath = $request->route()->parameter('query') ?? '/';
         if ($realPath === '/') {
-            abort(404);
+            return redirect()->route('home');
         }
         $file = $this->getFileOrCache($realPath);
         if (is_null($file) || array_has($file, 'folder')) {
-            abort(404);
+            Tool::showMessage('获取文件失败，请检查路径或稍后重试', false);
+
+            return view(config('olaindex.theme').'message');
         }
         $file['download'] = $file['@microsoft.graph.downloadUrl'];
         foreach ($this->show as $key => $suffix) {
@@ -257,8 +235,22 @@ class IndexController extends Controller
 
                         return redirect()->back();
                     } else {
-                        $file['content']
-                            = Tool::getFileContent($file['@microsoft.graph.downloadUrl'],false);
+                        $file['content'] = Tool::getFileContent(
+                            $file['@microsoft.graph.downloadUrl'],
+                            false
+                        );
+                        if ($key === 'stream') {
+                            $fileType
+                                = empty(Constants::FILE_STREAM[$file['ext']])
+                                ? "application/octet-stream"
+                                : Constants::FILE_STREAM[$file['ext']];
+
+                            return response(
+                                $file['content'],
+                                200,
+                                ['Content-type' => $fileType,]
+                            );
+                        }
                     }
                 }
                 // 处理缩略图
@@ -316,11 +308,15 @@ class IndexController extends Controller
     {
         $realPath = $request->route()->parameter('query') ?? '/';
         if ($realPath === '/') {
-            abort(404);
+            Tool::showMessage('下载失败，请检查路径或稍后重试', false);
+
+            return view(config('olaindex.theme').'message');
         }
         $file = $this->getFileOrCache($realPath);
         if (is_null($file) || array_has($file, 'folder')) {
-            abort(404);
+            Tool::showMessage('下载失败，请检查路径或稍后重试', false);
+
+            return view(config('olaindex.theme').'message');
         }
         $url = $file['@microsoft.graph.downloadUrl'];
 
@@ -378,11 +374,15 @@ class IndexController extends Controller
     {
         $realPath = $request->route()->parameter('query') ?? '/';
         if ($realPath === '/') {
-            abort(404);
+            Tool::showMessage('获取失败，请检查路径或稍后重试', false);
+
+            return view(config('olaindex.theme').'message');
         }
         $file = $this->getFileOrCache($realPath);
         if (is_null($file) || array_has($file, 'folder')) {
-            abort(404);
+            Tool::showMessage('获取失败，请检查路径或稍后重试', false);
+
+            return view(config('olaindex.theme').'message');
         }
         $download = $file['@microsoft.graph.downloadUrl'];
 
@@ -398,6 +398,12 @@ class IndexController extends Controller
     public function search(Request $request)
     {
         $keywords = $request->get('keywords');
+        $limit = $request->get('limit', 20);
+        if (!is_numeric($limit)) {
+            Tool::showMessage('非法请求', false);
+
+            return view(config('olaindex.theme').'message');
+        }
         if ($keywords) {
             $path = Tool::getEncodeUrl($this->root);
             $response = OneDrive::search($path, $keywords);
@@ -414,7 +420,6 @@ class IndexController extends Controller
         } else {
             $items = [];
         }
-        $limit = $request->get('limit', 20);
         $items = Tool::paginate($items, $limit);
 
         return view(config('olaindex.theme').'search', compact('items'));
@@ -446,34 +451,29 @@ class IndexController extends Controller
 
     /**
      * @return \Illuminate\Contracts\View\Factory|\Illuminate\Http\RedirectResponse|\Illuminate\View\View
-     * @throws \ErrorException
      */
     public function handlePassword()
     {
         $password = request()->get('password');
-        $origin_path = decrypt(request()->get('origin_path'));
-        $pass_id = decrypt(request()->get('pass_id'));
+        $route = decrypt(request()->get('route'));
+        $realPath = decrypt(request()->get('realPath'));
+        $encryptKey = decrypt(request()->get('encryptKey'));
         $data = [
-            'password' => encrypt($password),
-            'expires'  => time() + (int)$this->expires * 60, // 目录密码过期时间
+            'password'   => encrypt($password),
+            'encryptKey' => $encryptKey,
+            'expires'    => time() + (int)$this->expires * 60, // 目录密码过期时间
         ];
-        Session::put('password:'.$origin_path, $data);
-        $response = OneDrive::getItem($pass_id);
-        if ($response['errno'] === 0) {
-            $url = $response['data']['@microsoft.graph.downloadUrl'];
-            $directory_password = Tool::getFileContent($url, false);
-        } else {
-            Tool::showMessage('获取文件夹密码失败', false);
-            $directory_password = '';
-        }
+        Session::put('password:'.$encryptKey, $data);
+        $arr = Tool::handleEncryptDir(Tool::config('encrypt_path'));
+        $directory_password = $arr[$encryptKey];
         if (strcmp($password, $directory_password) === 0) {
-            return redirect()->route('home', Tool::getEncodeUrl($origin_path));
+            return redirect()->route($route, Tool::getEncodeUrl($realPath));
         } else {
             Tool::showMessage('密码错误', false);
 
             return view(
                 config('olaindex.theme').'password',
-                compact('origin_path', 'pass_id')
+                compact('route', 'realPath', 'encryptKey')
             );
         }
     }

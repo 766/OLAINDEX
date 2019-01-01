@@ -553,6 +553,49 @@ class Tool
         }
     }
 
+    /**
+     * 解析加密目录
+     *
+     * @param $str
+     *
+     * @return array
+     */
+    public static function handleEncryptDir($str)
+    {
+        $str = str_replace(PHP_EOL, '', $str);
+        $str = trim($str, ',');
+        $encryptPathList = explode(',', $str);
+        $all = [];
+        foreach ($encryptPathList as $encryptPathDir) {
+            $pathItem = explode(' ', $encryptPathDir);
+            $password = array_pop($pathItem);
+            $pa = array_fill_keys($pathItem, $password);
+            $all = array_merge($pa, $all);
+        }
+        uksort($all, [Tool::class, 'lenSort']);
+
+        return $all;
+    }
+
+    /**
+     * @param $a
+     * @param $b
+     *
+     * @return int
+     */
+    public static function lenSort($a, $b)
+    {
+        $countA = count(explode('/', self::getAbsolutePath($a)));
+        $countB = count(explode('/', self::getAbsolutePath($b)));
+
+        return $countB - $countA;
+    }
+
+    /**
+     * @param $ext
+     *
+     * @return string
+     */
     public static function fileIcon($ext)
     {
         if (in_array($ext, ['ogg', 'mp3', 'wav'])) {
