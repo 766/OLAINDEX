@@ -77,5 +77,13 @@
         "optimize-autoloader": true
     },
     "minimum-stability": "dev",
-    "prefer-stable": true
+    "prefer-stable": true,
+	"post-install-cmd": [
+		"chmod -R 777 public/",
+		"chmod -R 755 storage/",
+		"chown -R www:www *",
+		"php artisan od:install",
+		"chmod 777 storage/app/config.json",
+		"php artisan key:generate"
+	]
 }
